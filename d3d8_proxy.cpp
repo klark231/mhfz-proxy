@@ -4,26 +4,45 @@
 
 void Log(const char* msg) {
     FILE* f = fopen("mhfz_proxy.log", "a");
-    if (f) {
-        fprintf(f, "%s\n", msg);
-        fclose(f);
-    }
+    if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
 typedef void* (WINAPI* Direct3DCreate8_t)(UINT SDKVersion);
 Direct3DCreate8_t Real_Direct3DCreate8 = nullptr;
 
-// Hook variables
 typedef void (__cdecl* tLogicUpdate)();
 tLogicUpdate Original_LogicUpdate = nullptr;
 int frameCounter = 0;
 
-// This runs every time the main loop tries to call 0x11514c60
+// The exact addresses of the 21 MOV instructions in FUN_11514c60
+uintptr_t timerAddrs[] = {
+    0x1514f91, 0x1514fa7, 0x1514fbd, 0x1514fd3, 0x1514fe9, 0x1514fff,
+    0x1515015, 0x151502b, 0x1515041, 0x1515057, 0x151506d, 0x1515083,
+    0x1515099, 0x15150af, 0x15150c5, 0x15150db, 0x15150f1, 0x1515107,
+    0x151511d, 0x1515133, 0x1515149
+};
+
 void __cdecl Hooked_LogicUpdate() {
     frameCounter++;
-    // Only run the logic (timers, cooldowns) every OTHER frame
-    if (frameCounter % 2 == 0) {
-        Original_LogicUpdate();
+    // Check if this is an odd frame (1, 3, 5...)
+    bool skipTimers = (frameCounter % 2 != 0);
+    uintptr_t base = (uintptr_t)GetModuleHandleA("mhfo.dll");
+    
+    if (skipTimers) {
+        // Change the decrement from -1 (0xFFFF) to 0 (0x0000)
+        for (int i = 0; i < 21; i++) {
+            *(uint16_t*)(base + timerAddrs[i]) = 0x0000;
+        }
+    }
+    
+    // Run the original function (network, input, and timers)
+    Original_LogicUpdate();
+    
+    if (skipTimers) {
+        // Restore the decrement back to -1 (0xFFFF) for the next frame
+        for (int i = 0; i < 21; i++) {
+            *(uint16_t*)(base + timerAddrs[i]) = 0xFFFF;
+        }
     }
 }
 
@@ -34,7 +53,6 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
         Sleep(100);
     }
     
-    char buf[256];
     DWORD oldProtect;
 
     // 1. Patch Limiter to 0x10 (16ms = 60 FPS)
@@ -45,23 +63,20 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
         Log("SUCCESS: Frame limiter patched to 16ms (60 FPS).");
     }
 
-    // 2. Hook the CALL instruction at base + 0x8c815c
-    void* callSite = (void*)(base + 0x8c815c);
-    Original_LogicUpdate = (tLogicUpdate)(base + 0x11514c60);
+    // 2. Hook the beginning of FUN_11514c60 (base + 0x1514c60)
+    void* funcAddr = (void*)(base + 0x1514c60);
+    Original_LogicUpdate = (tLogicUpdate)funcAddr;
 
-    if (VirtualProtect(callSite, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        // Calculate relative address for the CALL instruction
-        uintptr_t relativeAddr = (uintptr_t)&Hooked_LogicUpdate - ((uintptr_t)callSite + 5);
-        
-        *(BYTE*)callSite = 0xE8; // CALL opcode
-        *(uintptr_t*)((uintptr_t)callSite + 1) = relativeAddr;
-
-        VirtualProtect(callSite, 5, oldProtect, &oldProtect);
-        sprintf(buf, "SUCCESS: Hooked logic loop at 0x%08X", (uintptr_t)callSite);
-        Log(buf);
-    } else {
-        Log("FAILED to hook logic loop.");
+    if (VirtualProtect(funcAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        uintptr_t relativeAddr = (uintptr_t)&Hooked_LogicUpdate - ((uintptr_t)funcAddr + 5);
+        *(BYTE*)funcAddr = 0xE9; // JMP instruction
+        *(uintptr_t*)((uintptr_t)funcAddr + 1) = relativeAddr;
+        VirtualProtect(funcAddr, 5, oldProtect, &oldProtect);
+        Log("SUCCESS: Hooked LogicUpdate function.");
     }
+
+    // 3. Make sure the timer memory addresses are writable
+    VirtualProtect((void*)(base + 0x1514f91), 0x1000, PAGE_EXECUTE_READWRITE, &oldProtect);
 
     return 0;
 }
@@ -69,7 +84,6 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        Log("--- Proxy d3d8.dll Loaded ---");
         HMODULE realD3D8 = LoadLibraryA("dxvk_d3d8.dll");
         if (realD3D8) {
             Real_Direct3DCreate8 = (Direct3DCreate8_t)GetProcAddress(realD3D8, "Direct3DCreate8");
