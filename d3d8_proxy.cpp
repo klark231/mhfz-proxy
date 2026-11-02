@@ -25,7 +25,6 @@ uintptr_t timerAddrs[] = {
 
 void __cdecl Hooked_LogicUpdate() {
     frameCounter++;
-    // Check if this is an odd frame (1, 3, 5...)
     bool skipTimers = (frameCounter % 2 != 0);
     uintptr_t base = (uintptr_t)GetModuleHandleA("mhfo.dll");
     
@@ -64,30 +63,35 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
         Log("SUCCESS: Frame limiter patched to 16ms (60 FPS).");
     }
 
-    // 2. Hook the beginning of FUN_11514c60 using a Trampoline
+    // 2. Hook the beginning of FUN_11514c60 using a 9-byte Trampoline
     void* hookAddr = (void*)(base + 0x1514c60);
+    int hookSize = 9; // 1 byte (PUSH EBP) + 2 bytes (MOV EBP,ESP) + 6 bytes (SUB ESP, 0x414)
     
-    // Allocate executable memory for the trampoline
     void* trampoline = VirtualAlloc(NULL, 1024, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (trampoline) {
-        // Copy the first 5 bytes of the original function to the trampoline
-        memcpy(trampoline, hookAddr, 5);
+        // Copy 9 bytes of the original function to the trampoline
+        memcpy(trampoline, hookAddr, hookSize);
         
-        // Add a JMP instruction in the trampoline to jump back to the original function (hookAddr + 5)
-        uintptr_t jumpBack = ((uintptr_t)hookAddr + 5) - ((uintptr_t)trampoline + 10);
-        *(BYTE*)((uintptr_t)trampoline + 5) = 0xE9;
-        *(uintptr_t*)((uintptr_t)trampoline + 6) = jumpBack;
+        // Add a JMP instruction in the trampoline to jump back to the original function (hookAddr + 9)
+        *(BYTE*)((uintptr_t)trampoline + hookSize) = 0xE9;
+        uintptr_t jumpBack = ((uintptr_t)hookAddr + hookSize) - ((uintptr_t)trampoline + hookSize + 5);
+        *(uintptr_t*)((uintptr_t)trampoline + hookSize + 1) = jumpBack;
         
-        // Point Original_LogicUpdate to the trampoline, NOT the hook address
         Original_LogicUpdate = (tLogicUpdate)trampoline;
 
         // Overwrite the original function with a JMP to our hook
-        if (VirtualProtect(hookAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        if (VirtualProtect(hookAddr, hookSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             uintptr_t relativeAddr = (uintptr_t)&Hooked_LogicUpdate - ((uintptr_t)hookAddr + 5);
             *(BYTE*)hookAddr = 0xE9; 
             *(uintptr_t*)((uintptr_t)hookAddr + 1) = relativeAddr;
-            VirtualProtect(hookAddr, 5, oldProtect, &oldProtect);
-            Log("SUCCESS: Hooked LogicUpdate function with Trampoline.");
+            
+            // Pad the remaining 4 bytes with NOP (0x90) to keep the 9 bytes clean
+            for (int i = 5; i < hookSize; i++) {
+                *(BYTE*)((uintptr_t)hookAddr + i) = 0x90;
+            }
+            
+            VirtualProtect(hookAddr, hookSize, oldProtect, &oldProtect);
+            Log("SUCCESS: Hooked LogicUpdate function with 9-byte trampoline.");
         }
     }
 
@@ -99,7 +103,7 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        if (isInitialized) return TRUE; // Prevent double-hooking
+        if (isInitialized) return TRUE; // Prevent double-hooking if DLL loads twice
         isInitialized = true;
         
         DisableThreadLibraryCalls(hModule);
