@@ -1,0 +1,25 @@
+name: Build D3D8 Proxy
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86 # 32-bit is required
+
+    - name: Compile DLL
+      run: |
+        cl.exe /LD /MT /O2 d3d8_proxy.cpp /link /DEF:d3d8.def /OUT:d3d8.dll
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: d3d8-proxy-dll
+        path: d3d8.dll
