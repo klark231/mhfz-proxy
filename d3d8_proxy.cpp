@@ -13,6 +13,7 @@ Direct3DCreate8_t Real_Direct3DCreate8 = nullptr;
 typedef void (__cdecl* tLogicUpdate)();
 tLogicUpdate Original_LogicUpdate = nullptr;
 int frameCounter = 0;
+bool isInitialized = false;
 
 // The exact addresses of the 21 MOV instructions in FUN_11514c60
 uintptr_t timerAddrs[] = {
@@ -35,11 +36,11 @@ void __cdecl Hooked_LogicUpdate() {
         }
     }
     
-    // Run the original function (network, input, and timers)
+    // Run the original function via the trampoline
     Original_LogicUpdate();
     
     if (skipTimers) {
-        // Restore the decrement back to -1 (0xFFFF) for the next frame
+        // Restore the decrement back to -1 (0xFFFF)
         for (int i = 0; i < 21; i++) {
             *(uint16_t*)(base + timerAddrs[i]) = 0xFFFF;
         }
@@ -63,19 +64,34 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
         Log("SUCCESS: Frame limiter patched to 16ms (60 FPS).");
     }
 
-    // 2. Hook the beginning of FUN_11514c60 (base + 0x1514c60)
-    void* funcAddr = (void*)(base + 0x1514c60);
-    Original_LogicUpdate = (tLogicUpdate)funcAddr;
+    // 2. Hook the beginning of FUN_11514c60 using a Trampoline
+    void* hookAddr = (void*)(base + 0x1514c60);
+    
+    // Allocate executable memory for the trampoline
+    void* trampoline = VirtualAlloc(NULL, 1024, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (trampoline) {
+        // Copy the first 5 bytes of the original function to the trampoline
+        memcpy(trampoline, hookAddr, 5);
+        
+        // Add a JMP instruction in the trampoline to jump back to the original function (hookAddr + 5)
+        uintptr_t jumpBack = ((uintptr_t)hookAddr + 5) - ((uintptr_t)trampoline + 10);
+        *(BYTE*)((uintptr_t)trampoline + 5) = 0xE9;
+        *(uintptr_t*)((uintptr_t)trampoline + 6) = jumpBack;
+        
+        // Point Original_LogicUpdate to the trampoline, NOT the hook address
+        Original_LogicUpdate = (tLogicUpdate)trampoline;
 
-    if (VirtualProtect(funcAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        uintptr_t relativeAddr = (uintptr_t)&Hooked_LogicUpdate - ((uintptr_t)funcAddr + 5);
-        *(BYTE*)funcAddr = 0xE9; // JMP instruction
-        *(uintptr_t*)((uintptr_t)funcAddr + 1) = relativeAddr;
-        VirtualProtect(funcAddr, 5, oldProtect, &oldProtect);
-        Log("SUCCESS: Hooked LogicUpdate function.");
+        // Overwrite the original function with a JMP to our hook
+        if (VirtualProtect(hookAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            uintptr_t relativeAddr = (uintptr_t)&Hooked_LogicUpdate - ((uintptr_t)hookAddr + 5);
+            *(BYTE*)hookAddr = 0xE9; 
+            *(uintptr_t*)((uintptr_t)hookAddr + 1) = relativeAddr;
+            VirtualProtect(hookAddr, 5, oldProtect, &oldProtect);
+            Log("SUCCESS: Hooked LogicUpdate function with Trampoline.");
+        }
     }
 
-    // 3. Make sure the timer memory addresses are writable
+    // Make sure the timer memory addresses are writable
     VirtualProtect((void*)(base + 0x1514f91), 0x1000, PAGE_EXECUTE_READWRITE, &oldProtect);
 
     return 0;
@@ -83,6 +99,9 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        if (isInitialized) return TRUE; // Prevent double-hooking
+        isInitialized = true;
+        
         DisableThreadLibraryCalls(hModule);
         HMODULE realD3D8 = LoadLibraryA("dxvk_d3d8.dll");
         if (realD3D8) {
